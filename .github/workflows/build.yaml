@@ -68,7 +68,7 @@ jobs:
       - name: Push single-arch images
         id: push-images
         run: |
-          images=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>" | grep -v "/" | sort -u | tr '\n' ' ')
+          images=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>" | grep -v '\.' | sort -u | tr '\n' ' ')
           echo "images='$images'" >> "$GITHUB_OUTPUT"
           mkdir -p artifacts
           for image in $images; do
