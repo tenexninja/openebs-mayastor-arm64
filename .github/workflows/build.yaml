@@ -5,7 +5,7 @@ on:
     inputs:
       tag:
         required: true
-        default: "v2.9.1"
+        default: "v2.11.1"
         description: The https://github.com/openebs/mayastor-extensions git tag to pull & build
 
 jobs:
@@ -43,20 +43,33 @@ jobs:
           ref: ${{ inputs.tag }}
           submodules: 'recursive'
           fetch-depth: 0
-      - run: |
-          # BUG: HEAD tag is fetched as lightweight instead of annotated
-          # https://github.com/actions/checkout/issues/290
-          if [ "${{ github.ref_type }}" == "tag" ]; then
-            git fetch -f origin ${{ github.ref }}:${{ github.ref }}
-          fi
+      - name: Verify the checkout matches the requested tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          # Fail early on a typo or a branch name: the images are tagged and
+          # versioned with $TAG below, so it must name this exact commit.
+          tag_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          [ "$tag_commit" = "$(git rev-parse HEAD)" ]
+          echo "$TAG -> $tag_commit ($(git cat-file -t "refs/tags/$TAG") tag)"
 
       - uses: cachix/install-nix-action@v31.3.0
       - name: Patch mayastor on arm64 (add --with-crypto flag to spdk)
         run: sed -Ei 's/(armv8-a\+crypto")/\1 "--with-crypto"/' spdk-rs/build_scripts/build_spdk.sh
         if: ${{ matrix.runner == 'ubuntu-24.04-arm' && matrix.repo == 'mayastor' }}
-      - name: Build and push the release images
-        # run: ./scripts/release.sh --registry "ghcr.io/${{ github.repository_owner }}"
-        run: ./scripts/release.sh --skip-publish --skip-bins
+      - name: Build the release images
+        env:
+          TAG: ${{ inputs.tag }}
+        # Pass --tag explicitly. Without it, release.sh and nix/lib/version.nix
+        # derive the version from `git describe --exact-match`, which ignores
+        # LIGHTWEIGHT tags. Some upstream release tags are lightweight (all three
+        # repos at v2.11.1), and actions/checkout fetches even annotated tags as
+        # lightweight (https://github.com/actions/checkout/issues/290). The build
+        # then falls back to the commit hash: images are tagged with the short
+        # sha, and binaries report the previous annotated tag (v2.11.0-N-g<sha>).
+        # --tag makes release.sh pass `--argstr tag` to nix, which sets both the
+        # image tag and the embedded GIT_VERSION to $TAG.
+        run: ./scripts/release.sh --skip-publish --skip-bins --tag "$TAG"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -66,23 +79,29 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push single-arch images
-        id: push-images
+        env:
+          TAG: ${{ inputs.tag }}
+          REGISTRY: ghcr.io/${{ github.repository_owner }}
+          ARCH: ${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}
+          LIST: artifacts/images-${{ matrix.repo }}-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}.txt
         run: |
-          images=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>" | grep '^openebs/' | sort -u | tr '\n' ' ')
-          echo "images='$images'" >> "$GITHUB_OUTPUT"
+          # Only the images this build produced: release.sh tags all of them $TAG.
+          mapfile -t images < <(docker images --format '{{.Repository}}:{{.Tag}}' \
+            | awk -F: -v tag="$TAG" '$1 ~ /^openebs\// && $2 == tag' | sort -u)
+          if [ "${#images[@]}" -eq 0 ]; then
+            echo "::error::release.sh produced no openebs/*:$TAG images"
+            exit 1
+          fi
           mkdir -p artifacts
-          for image in $images; do
-            [[ "${{ matrix.runner }}" == *-arm ]] && arch="arm64" || arch="amd64"
-            new_tag="ghcr.io/${{ github.repository_owner }}/$image-$arch"
+          for image in "${images[@]}"; do
+            new_tag="$REGISTRY/$image-$ARCH"
             echo "Pushing image '$image' to '$new_tag'"
-            docker tag $image $new_tag
-            docker push $new_tag
-
+            docker tag "$image" "$new_tag"
+            docker push "$new_tag"
             # Store the base image name for later merging
-            echo "$image" >> artifacts/images-${{ matrix.repo }}-${arch}.txt
-            echo "✅ Successfully pushed single-arch image for $image"
-            cat artifacts/images-${{ matrix.repo }}-${arch}.txt
+            echo "$image" >> "$LIST"
           done
+          cat "$LIST"
 
       - name: Upload image list artifact
         uses: actions/upload-artifact@v4
